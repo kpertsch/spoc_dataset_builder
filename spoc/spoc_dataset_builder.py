@@ -236,7 +236,7 @@ class Spoc(MultiThreadedDatasetBuilder):
                             shape=(5,),
                             dtype=np.float32,
                             doc='Indicates the bounding box for the target object in the manipulation camera. '
-                                'values are [x1, y1, x2, y2, area]. [1000, 1000, 1000, 1000, 0] for no box.',
+                                '[x1, y1, x2, y2, area] in pixels. [1000, 1000, 1000, 1000, 0] for no box.',
                         ),
                         'minimum_l2_target_distance': tfds.features.Scalar(
                             dtype=np.float32,
@@ -251,7 +251,7 @@ class Spoc(MultiThreadedDatasetBuilder):
                             shape=(5,),
                             dtype=np.float32,
                             doc='Indicates the bounding box for the target object in the navigation camera. '
-                                'values are [x1, y1, x2, y2, area]. [1000, 1000, 1000, 1000, 0] for no box.',
+                                '[x1, y1, x2, y2, area] in pixels. [1000, 1000, 1000, 1000, 0] for no box.',
                         ),
                         'relative_arm_location_metadata': tfds.features.Tensor(
                             shape=(4,),
