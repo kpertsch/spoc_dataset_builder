@@ -6,9 +6,8 @@ import h5py
 import os
 import json
 import numpy as np
-import tensorflow as tf
 import tensorflow_datasets as tfds
-from spoc.conversion_utils import MultiThreadedDatasetBuilder
+from spoc.conversion_utils import MultiThreadedDatasetBuilder, parse_bbox, convert_byte_to_string
 
 
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
@@ -25,28 +24,45 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 last_action_str = F['0']['last_action_str'][()]
                 last_action_success = F['0']['last_action_success'][()]
                 last_agent_location = F['0']['last_agent_location'][()]
-                # manip_accurate_object_bbox = F['0']['manip_accurate_object_bbox'][()]
-                # manip_task_relevant_object_bbox = F['0']['manip_task_relevant_object_bbox'][()]
                 minimum_l2_target_distance = F['0']['minimum_l2_target_distance'][()]
                 minimum_visible_target_alignment = F['0']['minimum_visible_target_alignment'][()]
-                # nav_accurate_object_bbox = F['0']['nav_accurate_object_bbox'][()]
-                # nav_task_relevant_object_bbox = F['0']['nav_task_relevant_object_bbox'][()]
                 relative_arm_location_metadata = F['0']['relative_arm_location_metadata'][()]
                 room_current_seen = F['0']['room_current_seen'][()]
                 rooms_seen = F['0']['rooms_seen'][()]
                 templated_task_spec = F['0']['templated_task_spec'][()]
                 visible_target_4m_count = F['0']['visible_target_4m_count'][()]
+
+                nav_object_bbox_group = F['0']['nav_accurate_object_bbox']
+                nav_bbox = {name: value[()] if isinstance(value, h5py.Dataset) else dict(value) for name, value in
+                            nav_object_bbox_group.items()}
+                manip_object_bbox_group = F['0']['manip_accurate_object_bbox']
+                manip_bbox = {name: value[()] if isinstance(value, h5py.Dataset) else dict(value) for name, value in
+                              manip_object_bbox_group.items()}
+
+
         except:
             print(f"Could not extract data for {episode_path} -- skipping.")
             return None
 
         # extract language instruction
         try:
-            language_instruction = json.loads(
-                bytearray(list(templated_task_spec[-1])).decode("utf-8"))['extras']['natural_language_description']
+            task_dict = json.loads(bytearray(list(templated_task_spec[-1])).decode("utf-8"))
+            language_instruction = task_dict['extras']['natural_language_description']
         except:
             print(f"Failed to extract language instruction for {episode_path} -- skipping")
             return None
+
+        # get the bounding boxes
+        # no receptacle IDs in this dataset, just the targets
+        tgt_1_ids = []
+        if "broad_synset_to_object_ids" in task_dict:
+            tgt_1_ids = [
+                val for val in task_dict["broad_synset_to_object_ids"].values()
+            ]
+            tgt_1_ids = sum(tgt_1_ids, [])
+        nav_object_bbox = parse_bbox(nav_bbox, tgt_1_ids)
+        manip_object_bbox = parse_bbox(manip_bbox, tgt_1_ids)
+
 
         # extract video frames
         def get_frames(filepath):
@@ -71,28 +87,35 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             print(f"Failed to extract video frames for {episode_path} -- skipping")
             return None
 
-        # extract actions
+        dimensions = ["base_theta", "base_z", "arm_y", "arm_z", "wrist_yaw", "pickup", "dropoff", "done", "sub_done"]
         try:
-            # TODO(kiana): check that this is correct -- currently we only have 2D actions?
-            act, act_str = [], []
-            for idx in range(len(nav_cam_frames) - 2):
-                print(bytearray(list(last_action_str[idx + 1]))[:np.argmin(last_action_str[idx + 1])].decode("utf-8"))
-                act_dict = json.loads(
-                    bytearray(list(last_action_str[idx + 1]))[:np.argmin(last_action_str[idx + 1])].decode("utf-8"))
-                action = np.zeros((2,), dtype=np.float32)
-                if "theta" in act_dict["action_values"]["base"]:
-                    action[0] = act_dict["action_values"]["base"]["theta"]
-                if "z" in act_dict["action_values"]["base"]:
-                    action[1] = act_dict["action_values"]["base"]["z"]
-                act.append(action)
-                if idx == 0:
-                    act_str.append("")
+            act, prev_act_str = [], []
+            raw_prev_action_strings = [convert_byte_to_string(a) for a in last_action_str]
+            for idx in range(len(raw_prev_action_strings)-1):
+                # Parse JSON or handle non-dict actions
+                if raw_prev_action_strings[idx+1].startswith('{'):
+                    act_dict = json.loads(raw_prev_action_strings[idx+1])
+                    action = np.zeros((len(dimensions),), dtype=np.float32)
+
+                    if "theta" in act_dict.get("action_values", {}).get("base", {}):
+                        action[dimensions.index("base_theta")] = act_dict["action_values"]["base"]["theta"]
+                    if "z" in act_dict.get("action_values", {}).get("base", {}):
+                        action[dimensions.index("base_z")] = act_dict["action_values"]["base"]["z"]
+                    if "y" in act_dict.get("action_values", {}).get("arm", {}):
+                        action[dimensions.index("arm_y")] = act_dict["action_values"]["arm"]["y"]
+                    if "z" in act_dict.get("action_values", {}).get("arm", {}):
+                        action[dimensions.index("arm_z")] = act_dict["action_values"]["arm"]["z"]
+                    if "yaw" in act_dict.get("action_values", {}).get("wrist", {}):
+                        action[dimensions.index("wrist_yaw")] = act_dict["action_values"]["wrist"]["yaw"]
                 else:
-                    act_str.append(
-                        bytearray(list(last_action_str[idx]))[:np.argmin(last_action_str[idx])].decode("utf-8")
-                    )
-            act.append(np.zeros((2,), dtype=np.float32))    # 0-action for final step
-            act_str.append("done")
+                    # Handle special actions
+                    action = np.zeros((len(dimensions),), dtype=np.float32)
+                    action[dimensions.index(raw_prev_action_strings[idx+1])] = 1.0
+
+                act.append(action)
+                prev_act_str.append(raw_prev_action_strings[idx])
+            # NOTE: as written done does not appear in the prev_act_str. It is always the last action but that has
+            # to stay implicit for the dimensions to work out.
         except:
             print(f"Failed to extract actions for {episode_path} -- skipping")
             return None
@@ -109,15 +132,13 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         house_index=house_index[i],
                         hypothetical_task_success=bool(hypothetical_task_success[i]),
                         last_action_is_random=bool(last_action_is_random[i]),
-                        last_action_str=act_str[i],
+                        last_action_str=prev_act_str[i],
                         last_action_success=bool(last_action_success[i]),
                         last_agent_location=np.asarray(last_agent_location[i], dtype=np.float32),
-                        # manip_accurate_object_bbox = manip_accurate_object_bbox[i],
-                        # manip_task_relevant_object_bbox = manip_task_relevant_object_bbox[i],
+                        manip_object_bbox=manip_object_bbox[i],
                         minimum_l2_target_distance=np.asarray(minimum_l2_target_distance[i][0], dtype=np.float32),
                         minimum_visible_target_alignment=np.asarray(minimum_visible_target_alignment[i][0], dtype=np.float32),
-                        # nav_accurate_object_bbox = nav_accurate_object_bbox[i],
-                        # nav_task_relevant_object_bbox = nav_task_relevant_object_bbox[i],
+                        nav_object_bbox=nav_object_bbox[i],
                         relative_arm_location_metadata=np.asarray(relative_arm_location_metadata[i], dtype=np.float32),
                         room_current_seen=bool(room_current_seen[i]),
                         rooms_seen=rooms_seen[i],
@@ -200,7 +221,7 @@ class Spoc(MultiThreadedDatasetBuilder):
                             doc='Indicates if the most recent action taken was chosen randomly.',
                         ),
                         'last_action_str': tfds.features.Text(
-                            doc="A string representation of the last action performed."
+                            doc="A string representation of the action previous to the current frame."
                         ),
                         'last_action_success': tfds.features.Scalar(
                             dtype=np.bool_,
@@ -211,17 +232,12 @@ class Spoc(MultiThreadedDatasetBuilder):
                             dtype=np.float32,
                             doc="Indicates agent's location in the world coordinate frame. [XYZ, 3xeuler in degree]",
                         ),
-                        # TODO(kiana): how should BB info be stored?
-                        # 'manip_accurate_object_bbox': tfds.features.Scalar(
-                        #     dtype=np.bool_,
-                        #     doc='Indicates the bounding box for the target object in the manipulation camera, '
-                        #         'based on one method of calculation in simulation.',
-                        # ),
-                        # 'manip_task_relevant_object_bbox': tfds.features.Scalar(
-                        #     dtype=np.bool_,
-                        #     doc='Indicates the bounding box for the target object in the manipulation camera, '
-                        #         'based on a second method of calculation in simulation.',
-                        # ),
+                        'manip_object_bbox': tfds.features.Tensor(
+                            shape=(5,),
+                            dtype=np.float32,
+                            doc='Indicates the bounding box for the target object in the manipulation camera. '
+                                'values are [x1, y1, x2, y2, area]. [1000, 1000, 1000, 1000, 0] for no box.',
+                        ),
                         'minimum_l2_target_distance': tfds.features.Scalar(
                             dtype=np.float32,
                             doc='The minimum Euclidean (L2) distance to the target object or location.',
@@ -231,21 +247,17 @@ class Spoc(MultiThreadedDatasetBuilder):
                             doc='Measures the minimum degree the agent needs to turn to center the object '
                                 'in the navigation camera frame (if object is visible).',
                         ),
-                        # 'nav_accurate_object_bbox': tfds.features.Scalar(
-                        #     dtype=np.bool_,
-                        #     doc='Indicates the bounding box for the target object in the navigation camera, '
-                        #         'based on one method of calculation in simulation.',
-                        # ),
-                        # 'nav_task_relevant_object_bbox': tfds.features.Scalar(
-                        #     dtype=np.bool_,
-                        #     doc='Indicates the bounding box for the target object in the navigation camera, '
-                        #         'based on a second method of calculation in simulation.',
-                        # ),
-                        # TODO(kiana): what do the different dimensions mean?
+                        'nav_object_bbox': tfds.features.Tensor(
+                            shape=(5,),
+                            dtype=np.float32,
+                            doc='Indicates the bounding box for the target object in the navigation camera. '
+                                'values are [x1, y1, x2, y2, area]. [1000, 1000, 1000, 1000, 0] for no box.',
+                        ),
                         'relative_arm_location_metadata': tfds.features.Tensor(
                             shape=(4,),
                             dtype=np.float32,
-                            doc="Arm proprioceptive, relative location of the arm in the agent's coordinate frame.",
+                            doc="Arm proprioceptive, relative location of the wrist in the agent's coordinate frame "
+                                "[x,y,z,wrist yaw in degrees]",
                         ),
                         'room_current_seen': tfds.features.Scalar(
                             dtype=np.bool_,
@@ -261,9 +273,13 @@ class Spoc(MultiThreadedDatasetBuilder):
                         ),
                     }),
                     'action': tfds.features.Tensor(
-                        shape=(2,),
+                        shape=(9,),
                         dtype=np.float32,
-                        doc='Robot action, consists of [1x rotation, 1x dZ].',
+                        doc='Spatial and special robot actions. Dimensions are '
+                            '["base_theta", "base_z", "arm_y", "arm_z", "wrist_yaw", "pickup", "dropoff", "done", "sub_done"]'
+                            'the last four are binary flags for the respective special actions, '
+                            '["base_z", "arm_y", "arm_z"] translation in meters, '
+                            '["base_theta","wrist_yaw"] rotation in degrees.'
                     ),
                     'discount': tfds.features.Scalar(
                         dtype=np.float32,
@@ -300,6 +316,6 @@ class Spoc(MultiThreadedDatasetBuilder):
         """Define filepaths for data splits."""
         print(self.info)
         return {
-            'train': glob.glob('/Users/karl/Downloads/quantized_ObjectNavOpenVocab/train/*/hdf5_sensors.hdf5'),
+            'train': glob.glob('/Users/roseh/Downloads/quantized_ObjectNavOpenVocab/train/*/hdf5_sensors.hdf5'),
         }
 
