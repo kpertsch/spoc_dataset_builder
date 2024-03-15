@@ -1,6 +1,5 @@
 from typing import Tuple, Any, Dict, Union, Callable, Iterable
 import numpy as np
-import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import itertools
@@ -191,8 +190,9 @@ class ParallelSplitBuilder(split_builder_lib.SplitBuilder):
             print("Writing conversion results...")
             for result in itertools.chain(*results):
                 key, serialized_example = result
-                writer._shuffler.add(key, serialized_example)
-                writer._num_examples += 1
+                if serialized_example:
+                    writer._shuffler.add(key, serialized_example)
+                    writer._num_examples += 1
         pool.close()
 
         print("Finishing split conversion...")
@@ -211,6 +211,7 @@ def dictlist2listdict(DL):
     " Converts a dict of lists to a list of dicts "
     return [dict(zip(DL, t)) for t in zip(*DL.values())]
 
+
 def chunks(l, n):
     """Yield n number of sequential chunks from l."""
     d, r = divmod(len(l), n)
@@ -218,9 +219,52 @@ def chunks(l, n):
         si = (d + 1) * (i if i < r else r) + d * (0 if i < r else i - r)
         yield l[si:si + (d + 1 if i < r else d)]
 
+
 def chunk_max(l, n, max_chunk_sum):
     out = []
     for _ in range(int(np.ceil(len(l) / max_chunk_sum))):
         out.append(list(chunks(l[:max_chunk_sum], n)))
         l = l[max_chunk_sum:]
     return out
+
+
+def convert_byte_to_string(bytes_to_decode: np.ndarray, max_len = None):
+    if max_len is None:
+        max_len = bytes_to_decode.shape[-1]
+    return (bytes_to_decode.view(f"S{max_len}")[0]).decode()
+
+
+def parse_bbox(sample, object_IDs):
+    oids = eval(convert_byte_to_string(sample["oids_as_bytes"][0]))
+    object_indices = [oids.index(oid) for oid in object_IDs]
+    object_indices = sorted(object_indices)
+    if (
+            len(object_indices) == 0
+    ):  # both bbox_1 and bbox_2 need to have a default value
+        res = np.zeros((len(sample["min_cols"]), 5))
+        res[:, :4] = 1000
+        return res
+    x1 = sample["min_cols"][:, object_indices].astype(int).astype(np.float32)
+    y1 = sample["min_rows"][:, object_indices].astype(int).astype(np.float32)
+    x2 = sample["max_cols"][:, object_indices].astype(int).astype(np.float32)
+    y2 = sample["max_rows"][:, object_indices].astype(int).astype(np.float32)
+    if np.any(x1 > x2):
+        x1, x2 = x2, x1
+    if np.any(y1 > y2):
+        y1, y2 = y2, y1
+    area = (y2 - y1) * (x2 - x1)
+    largest_area_oids = np.argmax(area, axis=1)
+    time_ids = np.arange(len(x1))
+    bboxes = np.stack(
+        [
+            x1[time_ids, largest_area_oids],
+            y1[time_ids, largest_area_oids],
+            x2[time_ids, largest_area_oids],
+            y2[time_ids, largest_area_oids],
+            area[time_ids, largest_area_oids],
+        ],
+        axis=1,
+    )
+    bboxes[bboxes == -1] = 1000
+    return bboxes
+
