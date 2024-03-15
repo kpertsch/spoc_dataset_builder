@@ -13,35 +13,35 @@ from spoc.conversion_utils import MultiThreadedDatasetBuilder, parse_bbox, conve
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
     """Yields episodes for list of data paths."""
 
-    def _parse_example(episode_path):
+    def _parse_example(episode_path, idx=0):
         # load raw data
         try:
             with h5py.File(episode_path, "r") as F:
-                an_object_is_in_hand = F['0']['an_object_is_in_hand'][()]
-                house_index = F['0']['house_index'][()]
-                hypothetical_task_success = F['0']['hypothetical_task_success'][()]
-                last_action_is_random = F['0']['last_action_is_random'][()]
-                last_action_str = F['0']['last_action_str'][()]
-                last_action_success = F['0']['last_action_success'][()]
-                last_agent_location = F['0']['last_agent_location'][()]
-                minimum_l2_target_distance = F['0']['minimum_l2_target_distance'][()]
-                minimum_visible_target_alignment = F['0']['minimum_visible_target_alignment'][()]
-                relative_arm_location_metadata = F['0']['relative_arm_location_metadata'][()]
-                room_current_seen = F['0']['room_current_seen'][()]
-                rooms_seen = F['0']['rooms_seen'][()]
-                templated_task_spec = F['0']['templated_task_spec'][()]
-                visible_target_4m_count = F['0']['visible_target_4m_count'][()]
+                an_object_is_in_hand = F[str(idx)]['an_object_is_in_hand'][()]
+                house_index = F[str(idx)]['house_index'][()]
+                hypothetical_task_success = F[str(idx)]['hypothetical_task_success'][()]
+                last_action_is_random = F[str(idx)]['last_action_is_random'][()]
+                last_action_str = F[str(idx)]['last_action_str'][()]
+                last_action_success = F[str(idx)]['last_action_success'][()]
+                last_agent_location = F[str(idx)]['last_agent_location'][()]
+                minimum_l2_target_distance = F[str(idx)]['minimum_l2_target_distance'][()]
+                minimum_visible_target_alignment = F[str(idx)]['minimum_visible_target_alignment'][()]
+                relative_arm_location_metadata = F[str(idx)]['relative_arm_location_metadata'][()]
+                room_current_seen = F[str(idx)]['room_current_seen'][()]
+                rooms_seen = F[str(idx)]['rooms_seen'][()]
+                templated_task_spec = F[str(idx)]['templated_task_spec'][()]
+                visible_target_4m_count = F[str(idx)]['visible_target_4m_count'][()]
 
-                nav_object_bbox_group = F['0']['nav_accurate_object_bbox']
+                nav_object_bbox_group = F[str(idx)]['nav_accurate_object_bbox']
                 nav_bbox = {name: value[()] if isinstance(value, h5py.Dataset) else dict(value) for name, value in
                             nav_object_bbox_group.items()}
-                manip_object_bbox_group = F['0']['manip_accurate_object_bbox']
+                manip_object_bbox_group = F[str(idx)]['manip_accurate_object_bbox']
                 manip_bbox = {name: value[()] if isinstance(value, h5py.Dataset) else dict(value) for name, value in
                               manip_object_bbox_group.items()}
 
 
         except:
-            print(f"Could not extract data for {episode_path} -- skipping.")
+            print(f"Could not extract data for {episode_path} at index {idx} -- skipping.")
             return None
 
         # extract language instruction
@@ -53,15 +53,21 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             return None
 
         # get the bounding boxes
-        # no receptacle IDs in this dataset, just the targets
         tgt_1_ids = []
+        tgt_2_ids = []
         if "broad_synset_to_object_ids" in task_dict:
             tgt_1_ids = [
                 val for val in task_dict["broad_synset_to_object_ids"].values()
             ]
             tgt_1_ids = sum(tgt_1_ids, [])
-        nav_object_bbox = parse_bbox(nav_bbox, tgt_1_ids)
-        manip_object_bbox = parse_bbox(manip_bbox, tgt_1_ids)
+        if "dest_receptacle_ids" in task_dict:
+            tgt_2_ids = task_dict["dest_receptacle_ids"]
+        nav_object_bbox_1 = parse_bbox(nav_bbox, tgt_1_ids)
+        nav_object_bbox_2 = parse_bbox(nav_bbox, tgt_2_ids)
+        nav_object_bbox = np.concatenate([nav_object_bbox_1, nav_object_bbox_2], axis=1, dtype=np.float32)
+        manip_object_bbox_1 = parse_bbox(manip_bbox, tgt_1_ids)
+        manip_object_bbox_2 = parse_bbox(manip_bbox, tgt_2_ids)
+        manip_object_bbox = np.concatenate([manip_object_bbox_1, manip_object_bbox_2], axis=1, dtype=np.float32)
 
 
         # extract video frames
@@ -77,9 +83,9 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
 
         try:
             nav_cam_frames = get_frames(
-                os.path.join(os.path.dirname(episode_path), "raw_navigation_camera__0.mp4"))
+                os.path.join(os.path.dirname(episode_path), f"raw_navigation_camera__{str(idx)}.mp4"))
             manipulation_cam_frames = get_frames(
-                os.path.join(os.path.dirname(episode_path), "raw_manipulation_camera__0.mp4"))
+                os.path.join(os.path.dirname(episode_path), f"raw_manipulation_camera__{str(idx)}.mp4"))
             if len(nav_cam_frames) != len(manipulation_cam_frames):
                 print(f"Number of frames does not match for {episode_path}-- skipping.")
                 return None
@@ -91,10 +97,10 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         try:
             act, prev_act_str = [], []
             raw_prev_action_strings = [convert_byte_to_string(a) for a in last_action_str]
-            for idx in range(len(raw_prev_action_strings)-1):
+            for frame_idx in range(len(raw_prev_action_strings)-1):
                 # Parse JSON or handle non-dict actions
-                if raw_prev_action_strings[idx+1].startswith('{'):
-                    act_dict = json.loads(raw_prev_action_strings[idx+1])
+                if raw_prev_action_strings[frame_idx+1].startswith('{'):
+                    act_dict = json.loads(raw_prev_action_strings[frame_idx+1])
                     action = np.zeros((len(dimensions),), dtype=np.float32)
 
                     if "theta" in act_dict.get("action_values", {}).get("base", {}):
@@ -110,10 +116,10 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 else:
                     # Handle special actions
                     action = np.zeros((len(dimensions),), dtype=np.float32)
-                    action[dimensions.index(raw_prev_action_strings[idx+1])] = 1.0
+                    action[dimensions.index(raw_prev_action_strings[frame_idx+1])] = 1.0
 
                 act.append(action)
-                prev_act_str.append(raw_prev_action_strings[idx])
+                prev_act_str.append(raw_prev_action_strings[frame_idx])
             # NOTE: as written done does not appear in the prev_act_str. It is always the last action but that has
             # to stay implicit for the dimensions to work out.
         except:
@@ -160,16 +166,26 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         sample = {
             'steps': episode,
             'episode_metadata': {
-                'file_path': episode_path
+                'file_path': f"{episode_path}_episode_{idx}"
             }
         }
 
         # if you want to skip an example for whatever reason, simply return None
-        return episode_path, sample
+        return f"{episode_path}_episode_{idx}", sample
+
+    episodes_to_process = []
+    for path in paths:
+        try:
+            with h5py.File(path, "r") as F:
+                num_episodes = len(F)
+                episodes_to_process.extend([(path, episode_index) for episode_index in range(num_episodes)])
+        except Exception as e:
+            print(f"Error processing path {path}: {e}")
 
     # for smallish datasets, use single-thread parsing
-    for sample in paths:
-        yield _parse_example(sample)
+    for sample, idx in episodes_to_process:
+        # print(f"Processing episode {sample} at index {idx}")
+        yield _parse_example(sample, idx)
 
 
 class Spoc(MultiThreadedDatasetBuilder):
@@ -187,7 +203,7 @@ class Spoc(MultiThreadedDatasetBuilder):
 
     def _info(self) -> tfds.core.DatasetInfo:
         """Dataset metadata (homepage, citation,...)."""
-        return self.dataset_info_from_configs(
+        base_info = self.dataset_info_from_configs(
             features=tfds.features.FeaturesDict({
                 'steps': tfds.features.Dataset({
                     'observation': tfds.features.FeaturesDict({
@@ -195,13 +211,13 @@ class Spoc(MultiThreadedDatasetBuilder):
                             shape=(224, 384, 3),
                             dtype=np.uint8,
                             encoding_format='jpeg',
-                            doc='Main camera RGB observation for navigation.',
+                            doc='Front-facing camera RGB observation for navigation.',
                         ),
                         'image_manipulation': tfds.features.Image(
                             shape=(224, 384, 3),
                             dtype=np.uint8,
                             encoding_format='jpeg',
-                            doc='Wrist camera RGB observation for manipulation.',
+                            doc='Arm-facing camera RGB observation for manipulation.',
                         ),
                         'an_object_is_in_hand': tfds.features.Scalar(
                             dtype=np.bool_,
@@ -213,7 +229,7 @@ class Spoc(MultiThreadedDatasetBuilder):
                         ),
                         'hypothetical_task_success': tfds.features.Scalar(
                             dtype=np.bool_,
-                            doc='Indicates whether the task will be successful if the agent '
+                            doc='Indicates whether the task would count as successful if the agent '
                                 'would have issued done at this step.',
                         ),
                         'last_action_is_random': tfds.features.Scalar(
@@ -233,10 +249,13 @@ class Spoc(MultiThreadedDatasetBuilder):
                             doc="Indicates agent's location in the world coordinate frame. [XYZ, 3xeuler in degree]",
                         ),
                         'manip_object_bbox': tfds.features.Tensor(
-                            shape=(5,),
+                            shape=(10,),
                             dtype=np.float32,
-                            doc='Indicates the bounding box for the target object in the manipulation camera. '
-                                '[x1, y1, x2, y2, area] in pixels. [1000, 1000, 1000, 1000, 0] for no box.',
+                            doc='Indicates bounding boxes for the target object in the manipulation camera. '
+                                '[x1_box1, y1_box1, x2_box1, y2_box1, area_box1, x1_box2, y1_box2, x2_box2, y2_box2, area_box2] '
+                                'in pixels. [1000, 1000, 1000, 1000, 0] for no box. Two boxes '
+                                'are possible for tasks with multiple task-relevant objects '
+                                '(i.e. specific receptacles, which will always be the second box.).',
                         ),
                         'minimum_l2_target_distance': tfds.features.Scalar(
                             dtype=np.float32,
@@ -248,10 +267,10 @@ class Spoc(MultiThreadedDatasetBuilder):
                                 'in the navigation camera frame (if object is visible).',
                         ),
                         'nav_object_bbox': tfds.features.Tensor(
-                            shape=(5,),
+                            shape=(10,),
                             dtype=np.float32,
-                            doc='Indicates the bounding box for the target object in the navigation camera. '
-                                '[x1, y1, x2, y2, area] in pixels. [1000, 1000, 1000, 1000, 0] for no box.',
+                            doc='Indicates the bounding boxes for the target object in the navigation camera. '
+                                'Units as in manip_object_bbox.',
                         ),
                         'relative_arm_location_metadata': tfds.features.Tensor(
                             shape=(4,),
@@ -307,15 +326,79 @@ class Spoc(MultiThreadedDatasetBuilder):
                 }),
                 'episode_metadata': tfds.features.FeaturesDict({
                     'file_path': tfds.features.Text(
-                        doc='Path to the original data file.'
+                        doc='Path to the original data file along with the episode index for that house.'
                     ),
                 }),
             }))
+        custom_info = tfds.core.DatasetInfo(
+            builder=self,
+            description=(
+                "Shortest-path trajectories conditioned on natural language instructions generated "
+                "in simulation using heuristic experts on the Hello Robot Stretch. 'limited_type' splits are "
+                "generated targeting on a subset of 15 object types. 'all_type' splits use a "
+                "much richer set of objects. The target object splits use the same houses, "
+                "but val/train splits use separate houses and object instances."
+            ),
+            citation=(
+                "@article{ehsani2023imitating,title={Imitating Shortest Paths in Simulation "
+                "Enables Effective Navigation and Manipulation in the Real World},"
+                "author={Ehsani, Kiana and Gupta, Tanmay and Hendrix, Rose and Salvador, Jordi and "
+                "Weihs, Luca and Zeng, Kuo-Hao and Singh, Kunal Pratap and Kim, Yejin and Han, Winson and "
+                "Herrasti, Alvaro and others}"
+            ),
+            features=base_info.features,
+        )
+        return custom_info
 
     def _split_paths(self):
         """Define filepaths for data splits."""
+        relevant_tasks = [
+            "EasyFetchType",
+            "Fetch2SurfaceAffordance",
+            "Fetch2SurfaceLocalRef",
+            "Fetch2SurfaceObjRoom",
+            "Fetch2SurfaceOpenVocab",
+            "Fetch2SurfaceRelAttribute",
+            "Fetch2SurfaceType",
+            "FetchAffordance",
+            "FetchLocalRef",
+            "FetchObjRoom",
+            "FetchOpenVocab",
+            "FetchRelAttribute",
+            "FetchType",
+            "ObjectNavAffordance",
+            "ObjectNavMofN",
+            "ObjectNavMulti",
+            "ObjectNavOpenVocab",
+            "ObjectNavRelAttribute",
+            "ObjectNavRoom",
+            "ObjectNavRoomMulti",
+            "ObjectNavType",
+            "PickupOpenVocab",
+            "PickupType"
+        ]
         print(self.info)
-        return {
-            'train': glob.glob('/Users/roseh/Downloads/quantized_ObjectNavOpenVocab/train/*/hdf5_sensors.hdf5'),
+        base_path = '/data/datasets'
+        base_alltype = f"{base_path}/spoc_openX_alltype"
+        base_limitedtype = f"{base_path}/spoc_openX_limitedtype"
+
+        train_splits_all = {
+            f"{task}_train_alltype": glob.glob(f'{base_alltype}/{task}/train/*/hdf5_sensors.hdf5')
+            for task in relevant_tasks if glob.glob(f'{base_alltype}/{task}/train/*/hdf5_sensors.hdf5')
         }
+
+        val_splits_all = {
+            f"{task}_val_alltype": glob.glob(f'{base_alltype}/{task}/val/*/hdf5_sensors.hdf5')
+            for task in relevant_tasks if glob.glob(f'{base_alltype}/{task}/val/*/hdf5_sensors.hdf5')
+        }
+        train_splits_fifteen = {
+            f"{task}_train_limitedtype": glob.glob(f'{base_limitedtype}/{task}/train/*/hdf5_sensors.hdf5')
+            for task in relevant_tasks if glob.glob(f'{base_limitedtype}/{task}/train/*/hdf5_sensors.hdf5')
+        }
+        val_splits_fifteen = {
+            f"{task}_val_limitedtype": glob.glob(f'{base_limitedtype}/{task}/val/*/hdf5_sensors.hdf5')
+            for task in relevant_tasks if glob.glob(f'{base_limitedtype}/{task}/val/*/hdf5_sensors.hdf5')
+        }
+
+        return {**train_splits_all, **val_splits_all, **train_splits_fifteen, **val_splits_fifteen}
 

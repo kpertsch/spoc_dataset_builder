@@ -190,8 +190,9 @@ class ParallelSplitBuilder(split_builder_lib.SplitBuilder):
             print("Writing conversion results...")
             for result in itertools.chain(*results):
                 key, serialized_example = result
-                writer._shuffler.add(key, serialized_example)
-                writer._num_examples += 1
+                if serialized_example:
+                    writer._shuffler.add(key, serialized_example)
+                    writer._num_examples += 1
         pool.close()
 
         print("Finishing split conversion...")
@@ -210,6 +211,7 @@ def dictlist2listdict(DL):
     " Converts a dict of lists to a list of dicts "
     return [dict(zip(DL, t)) for t in zip(*DL.values())]
 
+
 def chunks(l, n):
     """Yield n number of sequential chunks from l."""
     d, r = divmod(len(l), n)
@@ -217,12 +219,14 @@ def chunks(l, n):
         si = (d + 1) * (i if i < r else r) + d * (0 if i < r else i - r)
         yield l[si:si + (d + 1 if i < r else d)]
 
+
 def chunk_max(l, n, max_chunk_sum):
     out = []
     for _ in range(int(np.ceil(len(l) / max_chunk_sum))):
         out.append(list(chunks(l[:max_chunk_sum], n)))
         l = l[max_chunk_sum:]
     return out
+
 
 def convert_byte_to_string(bytes_to_decode: np.ndarray, max_len = None):
     if max_len is None:
