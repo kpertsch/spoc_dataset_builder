@@ -47,10 +47,18 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         # extract language instruction
         try:
             task_dict = json.loads(bytearray(list(templated_task_spec[-1])).decode("utf-8"))
+            task_type = task_dict['task_type']
             language_instruction = task_dict['extras']['natural_language_description']
         except:
             print(f"Failed to extract language instruction for {episode_path} -- skipping")
             return None
+
+        if "limitedtype" in episode_path:
+            task_target_split = "limited_target_types"
+        elif "alltype" in episode_path:
+            task_target_split = "all_target_types"
+        else:
+            raise ValueError(f"Could not determine task target split for {episode_path}")
 
         # get the bounding boxes
         tgt_1_ids = []
@@ -68,7 +76,6 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         manip_object_bbox_1 = parse_bbox(manip_bbox, tgt_1_ids)
         manip_object_bbox_2 = parse_bbox(manip_bbox, tgt_2_ids)
         manip_object_bbox = np.concatenate([manip_object_bbox_1, manip_object_bbox_2], axis=1, dtype=np.float32)
-
 
         # extract video frames
         def get_frames(filepath):
@@ -97,10 +104,10 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         try:
             act, prev_act_str = [], []
             raw_prev_action_strings = [convert_byte_to_string(a) for a in last_action_str]
-            for frame_idx in range(len(raw_prev_action_strings)-1):
+            for frame_idx in range(len(raw_prev_action_strings) - 1):
                 # Parse JSON or handle non-dict actions
-                if raw_prev_action_strings[frame_idx+1].startswith('{'):
-                    act_dict = json.loads(raw_prev_action_strings[frame_idx+1])
+                if raw_prev_action_strings[frame_idx + 1].startswith('{'):
+                    act_dict = json.loads(raw_prev_action_strings[frame_idx + 1])
                     action = np.zeros((len(dimensions),), dtype=np.float32)
 
                     if "theta" in act_dict.get("action_values", {}).get("base", {}):
@@ -116,7 +123,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 else:
                     # Handle special actions
                     action = np.zeros((len(dimensions),), dtype=np.float32)
-                    action[dimensions.index(raw_prev_action_strings[frame_idx+1])] = 1.0
+                    action[dimensions.index(raw_prev_action_strings[frame_idx + 1])] = 1.0
 
                 act.append(action)
                 prev_act_str.append(raw_prev_action_strings[frame_idx])
@@ -143,7 +150,8 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         last_agent_location=np.asarray(last_agent_location[i], dtype=np.float32),
                         manip_object_bbox=manip_object_bbox[i],
                         minimum_l2_target_distance=np.asarray(minimum_l2_target_distance[i][0], dtype=np.float32),
-                        minimum_visible_target_alignment=np.asarray(minimum_visible_target_alignment[i][0], dtype=np.float32),
+                        minimum_visible_target_alignment=np.asarray(minimum_visible_target_alignment[i][0],
+                                                                    dtype=np.float32),
                         nav_object_bbox=nav_object_bbox[i],
                         relative_arm_location_metadata=np.asarray(relative_arm_location_metadata[i], dtype=np.float32),
                         room_current_seen=bool(room_current_seen[i]),
@@ -166,7 +174,9 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         sample = {
             'steps': episode,
             'episode_metadata': {
-                'file_path': f"{episode_path}_episode_{idx}"
+                'file_path': f"{episode_path}_episode_{idx}",
+                'task_target_split': task_target_split,
+                'task_type': task_type,
             }
         }
 
@@ -193,13 +203,17 @@ class Spoc(MultiThreadedDatasetBuilder):
 
     VERSION = tfds.core.Version('1.0.0')
     RELEASE_NOTES = {
-      '1.0.0': 'Initial release.',
+        '1.0.0': 'Initial release.',
     }
-    N_WORKERS = 10             # number of parallel workers for data conversion
+    N_WORKERS = 10  # number of parallel workers for data conversion
     MAX_PATHS_IN_MEMORY = 100  # number of paths converted & stored in memory before writing to disk
-                               # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
-                               # note that one path may yield multiple episodes and adjust accordingly
-    PARSE_FCN = _generate_examples      # handle to parse function from file paths to RLDS episodes
+    # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
+    # note that one path may yield multiple episodes and adjust accordingly
+    PARSE_FCN = _generate_examples  # handle to parse function from file paths to RLDS episodes
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cached_full_paths = None
 
     def _info(self) -> tfds.core.DatasetInfo:
         """Dataset metadata (homepage, citation,...)."""
@@ -328,16 +342,23 @@ class Spoc(MultiThreadedDatasetBuilder):
                     'file_path': tfds.features.Text(
                         doc='Path to the original data file along with the episode index for that house.'
                     ),
+                    'task_target_split': tfds.features.Text(
+                        doc="Indicates the target object split for the task (limited or all). Limited splits are "
+                            "generated targeting on a subset of 15 object types. 'all_type' splits use a "
+                            "much richer set of objects. The target object splits use the same houses."
+
+                    ),
+                    'task_type': tfds.features.Text(
+                        doc='Indicates the task type.'
+                    ),
                 }),
             }))
         custom_info = tfds.core.DatasetInfo(
             builder=self,
             description=(
                 "Shortest-path trajectories conditioned on natural language instructions generated "
-                "in simulation using heuristic experts on the Hello Robot Stretch. 'limited_type' splits are "
-                "generated targeting on a subset of 15 object types. 'all_type' splits use a "
-                "much richer set of objects. The target object splits use the same houses, "
-                "but val/train splits use separate houses and object instances."
+                "in simulation using heuristic experts on the Hello Robot Stretch.  "
+                "Val/train split uses separate houses with held-out object instances."
             ),
             citation=(
                 "@article{ehsani2023imitating,title={Imitating Shortest Paths in Simulation "
@@ -351,6 +372,10 @@ class Spoc(MultiThreadedDatasetBuilder):
         return custom_info
 
     def _split_paths(self):
+
+        if self._cached_full_paths is not None:
+            return self._cached_full_paths
+
         """Define filepaths for data splits."""
         relevant_tasks = [
             "EasyFetchType",
@@ -382,23 +407,15 @@ class Spoc(MultiThreadedDatasetBuilder):
         base_alltype = f"{base_path}/spoc_openX_alltype"
         base_limitedtype = f"{base_path}/spoc_openX_limitedtype"
 
-        train_splits_all = {
-            f"{task}_train_alltype": glob.glob(f'{base_alltype}/{task}/train/*/hdf5_sensors.hdf5')
-            for task in relevant_tasks if glob.glob(f'{base_alltype}/{task}/train/*/hdf5_sensors.hdf5')
-        }
 
-        val_splits_all = {
-            f"{task}_val_alltype": glob.glob(f'{base_alltype}/{task}/val/*/hdf5_sensors.hdf5')
-            for task in relevant_tasks if glob.glob(f'{base_alltype}/{task}/val/*/hdf5_sensors.hdf5')
-        }
-        train_splits_fifteen = {
-            f"{task}_train_limitedtype": glob.glob(f'{base_limitedtype}/{task}/train/*/hdf5_sensors.hdf5')
-            for task in relevant_tasks if glob.glob(f'{base_limitedtype}/{task}/train/*/hdf5_sensors.hdf5')
-        }
-        val_splits_fifteen = {
-            f"{task}_val_limitedtype": glob.glob(f'{base_limitedtype}/{task}/val/*/hdf5_sensors.hdf5')
-            for task in relevant_tasks if glob.glob(f'{base_limitedtype}/{task}/val/*/hdf5_sensors.hdf5')
-        }
+        full_paths = {"train": [], "val": []}
 
-        return {**train_splits_all, **val_splits_all, **train_splits_fifteen, **val_splits_fifteen}
-
+        for task in relevant_tasks:
+            for base in [base_alltype, base_limitedtype]:
+                for split in ["train", "val"]:
+                    pattern = f'{base}/{task}/{split}/*/hdf5_sensors.hdf5'
+                    paths = glob.glob(pattern)
+                    full_paths[split].extend(paths)
+                    print(f"Task: {task}, Split: {split}, Paths found: {len(paths)}")
+        self._cached_full_paths = full_paths
+        return full_paths
